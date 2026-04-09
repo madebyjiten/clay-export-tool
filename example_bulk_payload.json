@@ -1,0 +1,22 @@
+{
+  "rows": [
+    {
+      "external_id": "acme.com",
+      "data": {
+        "full_name": "John Doe",
+        "company": "Acme",
+        "email": "john@acme.com",
+        "linkedin_url": "https://linkedin.com/in/johndoe"
+      }
+    },
+    {
+      "external_id": "beta.io",
+      "data": {
+        "full_name": "Sarah Lee",
+        "company": "Beta",
+        "email": "sarah@beta.io",
+        "linkedin_url": "https://linkedin.com/in/sarahlee"
+      }
+    }
+  ]
+}

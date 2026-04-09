@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: clay-middleware-scaled
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clay-middleware-db
+          property: connectionString
+      - key: INGEST_API_KEY
+        sync: false
+      - key: DESTINATION_API_URL
+        sync: false
+      - key: DESTINATION_API_KEY
+        sync: false
+      - key: REQUEST_TIMEOUT
+        value: "30"
+      - key: MAX_BATCH_SIZE
+        value: "1000"
+
+databases:
+  - name: clay-middleware-db
+    plan: starter
