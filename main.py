@@ -82,6 +82,7 @@ def startup_event() -> None:
     init_db()
 
 class IngestBody(BaseModel):
+    batch_name: Optional[str] = None
     data: Dict[str, Any]
     external_id: Optional[str] = None
 
@@ -110,6 +111,8 @@ def upsert_rows(rows: List[IngestBody]) -> Dict[str, int]:
     payload = []
     for row in rows:
         normalized = normalize_payload(row.data)
+        if row.batch_name:
+            normalized["batch_name"] = row.batch_name
         payload.append(
             (
                 row.external_id,
@@ -167,6 +170,7 @@ async def ingest_raw(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Raw payload must be a JSON object")
     body = IngestBody(
+        batch_name=payload.get("batch_name"),
         external_id=payload.get("external_id") or payload.get("id"),
         data=payload,
     )
