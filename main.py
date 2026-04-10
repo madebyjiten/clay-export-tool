@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -11,7 +12,7 @@ from pydantic import BaseModel, Field
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
-APP_NAME = "Clay Middleware API - Scaled v2"
+APP_NAME = "Clay Middleware API - Scaled"
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 INGEST_API_KEY = os.getenv("INGEST_API_KEY", "")
 DESTINATION_API_URL = os.getenv("DESTINATION_API_URL", "")
@@ -31,15 +32,19 @@ pool = ConnectionPool(
 
 app = FastAPI(title=APP_NAME)
 
-
 def now_ts() -> int:
     return int(time.time())
-
 
 def require_api_key(x_api_key: Optional[str]) -> None:
     if INGEST_API_KEY and x_api_key != INGEST_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        json.dumps(payload)
+    except TypeError as exc:
+        raise HTTPException(status_code=400, detail=f"Payload is not JSON serializable: {exc}")
+    return payload
 
 def init_db() -> None:
     with pool.connection() as conn:
@@ -48,7 +53,6 @@ def init_db() -> None:
                 '''
                 CREATE TABLE IF NOT EXISTS records (
                     id BIGSERIAL PRIMARY KEY,
-                    batch_name TEXT NULL,
                     external_id TEXT NULL,
                     payload JSONB NOT NULL,
                     status TEXT NOT NULL DEFAULT 'stored',
@@ -58,11 +62,12 @@ def init_db() -> None:
                 )
                 '''
             )
-
-            cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS batch_name TEXT NULL")
-
             cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_records_external_id ON records(external_id)"
+                '''
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_records_external_id
+                ON records (external_id)
+                WHERE external_id IS NOT NULL
+                '''
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_status_id ON records(status, id DESC)"
@@ -70,55 +75,45 @@ def init_db() -> None:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_created_at ON records(created_at DESC)"
             )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_records_batch_name ON records(batch_name)"
-            )
         conn.commit()
-
 
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
 
-
 class IngestBody(BaseModel):
-    batch_name: Optional[str] = None
     data: Dict[str, Any]
     external_id: Optional[str] = None
 
-
 class BulkIngestBody(BaseModel):
     rows: List[IngestBody] = Field(default_factory=list)
-
 
 @app.get("/")
 def root() -> Dict[str, str]:
     return {"name": APP_NAME, "status": "ok", "docs": "/docs"}
 
-
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "healthy"}
 
-
-def insert_rows(rows: List[IngestBody]) -> Dict[str, int]:
+def upsert_rows(rows: List[IngestBody]) -> Dict[str, int]:
     if not rows:
         return {"received": 0, "inserted_or_updated": 0}
 
     if len(rows) > MAX_BATCH_SIZE:
         raise HTTPException(
             status_code=400,
-            detail=f"Batch too large. Max allowed is {MAX_BATCH_SIZE}",
+            detail=f"Batch too large. Max allowed is {MAX_BATCH_SIZE}"
         )
 
     ts = now_ts()
-    payload_rows = []
+    payload = []
     for row in rows:
-        payload_rows.append(
+        normalized = normalize_payload(row.data)
+        payload.append(
             (
-                row.batch_name,
                 row.external_id,
-                row.data,
+                json.dumps(normalized),
                 "stored",
                 None,
                 ts,
@@ -127,67 +122,68 @@ def insert_rows(rows: List[IngestBody]) -> Dict[str, int]:
         )
 
     sql = '''
-        INSERT INTO records (batch_name, external_id, payload, status, last_error, created_at, updated_at)
-        VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s)
+        INSERT INTO records (external_id, payload, status, last_error, created_at, updated_at)
+        VALUES (%s, %s::jsonb, %s, %s, %s, %s)
+        ON CONFLICT (external_id) WHERE external_id IS NOT NULL
+        DO UPDATE SET
+            payload = EXCLUDED.payload,
+            status = 'stored',
+            last_error = NULL,
+            updated_at = EXCLUDED.updated_at
     '''
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.executemany(sql, payload_rows)
+            cur.executemany(sql, payload)
         conn.commit()
 
     return {"received": len(rows), "inserted_or_updated": len(rows)}
 
-
 @app.post("/ingest")
-def ingest(body: IngestBody, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def ingest(
+    body: IngestBody,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     require_api_key(x_api_key)
-    result = insert_rows([body])
+    result = upsert_rows([body])
     return {"success": True, **result}
-
 
 @app.post("/bulk-ingest")
-def bulk_ingest(body: BulkIngestBody, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+def bulk_ingest(
+    body: BulkIngestBody,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     require_api_key(x_api_key)
-    result = insert_rows(body.rows)
+    result = upsert_rows(body.rows)
     return {"success": True, **result}
 
-
 @app.post("/ingest/raw")
-async def ingest_raw(request: Request, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+async def ingest_raw(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
     require_api_key(x_api_key)
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Raw payload must be a JSON object")
-
     body = IngestBody(
-        batch_name=payload.get("batch_name"),
         external_id=payload.get("external_id") or payload.get("id"),
-        data=payload.get("data", payload),
+        data=payload,
     )
-    result = insert_rows([body])
+    result = upsert_rows([body])
     return {"success": True, **result}
-
 
 @app.get("/records")
 def list_records(
     limit: int = Query(default=100, ge=1, le=5000),
     status: Optional[str] = Query(default=None),
-    batch_name: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
     params: List[Any] = []
-    sql = "SELECT id, batch_name, external_id, payload, status, last_error, created_at, updated_at FROM records"
+    sql = "SELECT id, external_id, payload, status, last_error, created_at, updated_at FROM records"
 
-    conditions = []
     if status:
-        conditions.append("status = %s")
+        sql += " WHERE status = %s"
         params.append(status)
-    if batch_name:
-        conditions.append("batch_name = %s")
-        params.append(batch_name)
-
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
 
     sql += " ORDER BY id DESC LIMIT %s"
     params.append(limit)
@@ -199,48 +195,17 @@ def list_records(
 
     return {"count": len(rows), "records": rows}
 
-
-@app.get("/batches")
-def list_batches() -> Dict[str, Any]:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                '''
-                SELECT
-                    batch_name,
-                    COUNT(*) AS row_count,
-                    MIN(created_at) AS first_created_at,
-                    MAX(created_at) AS last_created_at
-                FROM records
-                WHERE batch_name IS NOT NULL
-                GROUP BY batch_name
-                ORDER BY last_created_at DESC
-                '''
-            )
-            rows = cur.fetchall()
-
-    return {"count": len(rows), "batches": rows}
-
-
 @app.get("/export/json")
 def export_json(
     limit: int = Query(default=1000, ge=1, le=50000),
     status: Optional[str] = Query(default=None),
-    batch_name: Optional[str] = Query(default=None),
 ) -> JSONResponse:
     params: List[Any] = []
-    sql = "SELECT id, batch_name, external_id, payload AS data, status, last_error, created_at, updated_at FROM records"
+    sql = "SELECT id, external_id, payload AS data, status, last_error, created_at, updated_at FROM records"
 
-    conditions = []
     if status:
-        conditions.append("status = %s")
+        sql += " WHERE status = %s"
         params.append(status)
-    if batch_name:
-        conditions.append("batch_name = %s")
-        params.append(batch_name)
-
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
 
     sql += " ORDER BY id DESC LIMIT %s"
     params.append(limit)
@@ -252,26 +217,17 @@ def export_json(
 
     return JSONResponse(content={"count": len(rows), "rows": rows})
 
-
 @app.get("/export/csv")
 def export_csv(
     limit: int = Query(default=10000, ge=1, le=50000),
     status: Optional[str] = Query(default=None),
-    batch_name: Optional[str] = Query(default=None),
 ) -> StreamingResponse:
     params: List[Any] = []
-    sql = "SELECT id, batch_name, external_id, payload, status, last_error, created_at, updated_at FROM records"
+    sql = "SELECT id, external_id, payload, status, last_error, created_at, updated_at FROM records"
 
-    conditions = []
     if status:
-        conditions.append("status = %s")
+        sql += " WHERE status = %s"
         params.append(status)
-    if batch_name:
-        conditions.append("batch_name = %s")
-        params.append(batch_name)
-
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
 
     sql += " ORDER BY id DESC LIMIT %s"
     params.append(limit)
@@ -285,7 +241,6 @@ def export_csv(
     for row in rows:
         item = {
             "id": row["id"],
-            "batch_name": row["batch_name"],
             "external_id": row["external_id"],
             "status": row["status"],
             "last_error": row["last_error"],
@@ -307,39 +262,32 @@ def export_csv(
     writer.writerows(flattened_rows)
     output.seek(0)
 
-    filename = "clay_export.csv" if not batch_name else f"{batch_name}.csv"
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={"Content-Disposition": "attachment; filename=clay_export.csv"},
     )
-
 
 @app.post("/push")
 def push_records(
     limit: int = Query(default=500, ge=1, le=5000),
     only_status: str = Query(default="stored"),
-    batch_name: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
     if not DESTINATION_API_URL:
         raise HTTPException(status_code=400, detail="DESTINATION_API_URL is not configured")
 
-    params: List[Any] = [only_status]
-    sql = '''
-        SELECT id, batch_name, payload
-        FROM records
-        WHERE status = %s
-    '''
-    if batch_name:
-        sql += " AND batch_name = %s"
-        params.append(batch_name)
-
-    sql += " ORDER BY id ASC LIMIT %s"
-    params.append(limit)
-
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(
+                '''
+                SELECT id, payload
+                FROM records
+                WHERE status = %s
+                ORDER BY id ASC
+                LIMIT %s
+                ''',
+                (only_status, limit),
+            )
             rows = cur.fetchall()
 
     headers = {"Content-Type": "application/json"}
@@ -379,12 +327,7 @@ def push_records(
                     )
                 conn.commit()
 
-            result = {
-                "record_id": record_id,
-                "batch_name": row["batch_name"],
-                "ok": ok,
-                "status_code": response.status_code,
-            }
+            result = {"record_id": record_id, "ok": ok, "status_code": response.status_code}
             if error_text:
                 result["error"] = error_text
             results.append(result)
@@ -402,11 +345,6 @@ def push_records(
                     )
                 conn.commit()
 
-            results.append({
-                "record_id": record_id,
-                "batch_name": row["batch_name"],
-                "ok": False,
-                "error": str(exc),
-            })
+            results.append({"record_id": record_id, "ok": False, "error": str(exc)})
 
     return {"count": len(results), "results": results}
