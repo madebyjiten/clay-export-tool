@@ -31,12 +31,15 @@ pool = ConnectionPool(
 
 app = FastAPI(title=APP_NAME)
 
+
 def now_ts() -> int:
     return int(time.time())
+
 
 def require_api_key(x_api_key: Optional[str]) -> None:
     if INGEST_API_KEY and x_api_key != INGEST_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 def init_db() -> None:
     with pool.connection() as conn:
@@ -55,13 +58,11 @@ def init_db() -> None:
                 )
                 '''
             )
+
             cur.execute("ALTER TABLE records ADD COLUMN IF NOT EXISTS batch_name TEXT NULL")
+
             cur.execute(
-                '''
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_records_external_id_batch
-                ON records (external_id, COALESCE(batch_name, ''))
-                WHERE external_id IS NOT NULL
-                '''
+                "CREATE INDEX IF NOT EXISTS idx_records_external_id ON records(external_id)"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_status_id ON records(status, id DESC)"
@@ -74,32 +75,41 @@ def init_db() -> None:
             )
         conn.commit()
 
+
 @app.on_event("startup")
 def startup_event() -> None:
     init_db()
+
 
 class IngestBody(BaseModel):
     batch_name: Optional[str] = None
     data: Dict[str, Any]
     external_id: Optional[str] = None
 
+
 class BulkIngestBody(BaseModel):
     rows: List[IngestBody] = Field(default_factory=list)
+
 
 @app.get("/")
 def root() -> Dict[str, str]:
     return {"name": APP_NAME, "status": "ok", "docs": "/docs"}
 
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "healthy"}
 
-def upsert_rows(rows: List[IngestBody]) -> Dict[str, int]:
+
+def insert_rows(rows: List[IngestBody]) -> Dict[str, int]:
     if not rows:
         return {"received": 0, "inserted_or_updated": 0}
 
     if len(rows) > MAX_BATCH_SIZE:
-        raise HTTPException(status_code=400, detail=f"Batch too large. Max allowed is {MAX_BATCH_SIZE}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch too large. Max allowed is {MAX_BATCH_SIZE}",
+        )
 
     ts = now_ts()
     payload_rows = []
@@ -119,13 +129,6 @@ def upsert_rows(rows: List[IngestBody]) -> Dict[str, int]:
     sql = '''
         INSERT INTO records (batch_name, external_id, payload, status, last_error, created_at, updated_at)
         VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s)
-        ON CONFLICT (external_id, COALESCE(batch_name, '')) WHERE external_id IS NOT NULL
-        DO UPDATE SET
-            payload = EXCLUDED.payload,
-            status = 'stored',
-            last_error = NULL,
-            updated_at = EXCLUDED.updated_at,
-            batch_name = EXCLUDED.batch_name
     '''
 
     with pool.connection() as conn:
@@ -135,17 +138,20 @@ def upsert_rows(rows: List[IngestBody]) -> Dict[str, int]:
 
     return {"received": len(rows), "inserted_or_updated": len(rows)}
 
+
 @app.post("/ingest")
 def ingest(body: IngestBody, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     require_api_key(x_api_key)
-    result = upsert_rows([body])
+    result = insert_rows([body])
     return {"success": True, **result}
+
 
 @app.post("/bulk-ingest")
 def bulk_ingest(body: BulkIngestBody, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     require_api_key(x_api_key)
-    result = upsert_rows(body.rows)
+    result = insert_rows(body.rows)
     return {"success": True, **result}
+
 
 @app.post("/ingest/raw")
 async def ingest_raw(request: Request, x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
@@ -159,8 +165,9 @@ async def ingest_raw(request: Request, x_api_key: Optional[str] = Header(default
         external_id=payload.get("external_id") or payload.get("id"),
         data=payload.get("data", payload),
     )
-    result = upsert_rows([body])
+    result = insert_rows([body])
     return {"success": True, **result}
+
 
 @app.get("/records")
 def list_records(
@@ -192,6 +199,7 @@ def list_records(
 
     return {"count": len(rows), "records": rows}
 
+
 @app.get("/batches")
 def list_batches() -> Dict[str, Any]:
     with pool.connection() as conn:
@@ -212,6 +220,7 @@ def list_batches() -> Dict[str, Any]:
             rows = cur.fetchall()
 
     return {"count": len(rows), "batches": rows}
+
 
 @app.get("/export/json")
 def export_json(
@@ -242,6 +251,7 @@ def export_json(
             rows = cur.fetchall()
 
     return JSONResponse(content={"count": len(rows), "rows": rows})
+
 
 @app.get("/export/csv")
 def export_csv(
@@ -303,6 +313,7 @@ def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
 
 @app.post("/push")
 def push_records(
