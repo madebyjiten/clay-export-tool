@@ -172,7 +172,7 @@ async def ingest_raw(
     body = IngestBody(
         batch_name=payload.get("batch_name"),
         external_id=payload.get("external_id") or payload.get("id"),
-        data=payload,
+        data=payload.get("data", payload),
     )
     result = upsert_rows([body])
     return {"success": True, **result}
