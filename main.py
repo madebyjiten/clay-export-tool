@@ -63,11 +63,7 @@ def init_db() -> None:
                 '''
             )
             cur.execute(
-                '''
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_records_external_id
-                ON records (external_id)
-                WHERE external_id IS NOT NULL
-                '''
+    "CREATE INDEX IF NOT EXISTS idx_records_external_id ON records(external_id)"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_status_id ON records(status, id DESC)"
@@ -125,15 +121,9 @@ def upsert_rows(rows: List[IngestBody]) -> Dict[str, int]:
         )
 
     sql = '''
-        INSERT INTO records (external_id, payload, status, last_error, created_at, updated_at)
-        VALUES (%s, %s::jsonb, %s, %s, %s, %s)
-        ON CONFLICT (external_id) WHERE external_id IS NOT NULL
-        DO UPDATE SET
-            payload = EXCLUDED.payload,
-            status = 'stored',
-            last_error = NULL,
-            updated_at = EXCLUDED.updated_at
-    '''
+    INSERT INTO records (external_id, payload, status, last_error, created_at, updated_at)
+    VALUES (%s, %s::jsonb, %s, %s, %s, %s)
+'''
 
     with pool.connection() as conn:
         with conn.cursor() as cur:
