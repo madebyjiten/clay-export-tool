@@ -3,13 +3,16 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import gspread
 import requests
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from google.oauth2.service_account import Credentials
 from pydantic import BaseModel, Field
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
@@ -24,11 +27,16 @@ MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "1000"))
 EXPORT_MAX_ROWS = int(os.getenv("EXPORT_MAX_ROWS", "50000"))
 
 # --- Google Sheets mirror config ---
+# One spreadsheet (SHEET_ID). Every distinct Clay `batch_name` becomes its own
+# tab in that spreadsheet, rebuilt from Postgres. Rows with no batch_name land
+# in the UNGROUPED_TAB tab.
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON", "")
 SHEET_ID = os.getenv("SHEET_ID", "")
-SHEET_TAB = os.getenv("SHEET_TAB", "Leads")
-SYNC_ON_INGEST = os.getenv("SYNC_ON_INGEST", "").lower() in {"1", "true", "yes", "on"}
-SHEET_SYNC_MIN_INTERVAL = int(os.getenv("SHEET_SYNC_MIN_INTERVAL", "15"))
+UNGROUPED_TAB = os.getenv("UNGROUPED_TAB", "ungrouped")
+SYNC_ON_INGEST = os.getenv("SYNC_ON_INGEST", "true").lower() in {"1", "true", "yes", "on"}
+# Seconds a batch's sync worker waits before each rebuild, so a burst of chunks
+# for the same export collapses into one write instead of one write per chunk.
+SHEET_SYNC_SETTLE_SECONDS = float(os.getenv("SHEET_SYNC_SETTLE_SECONDS", "3"))
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 logging.basicConfig(level=logging.INFO)
@@ -46,8 +54,17 @@ pool = ConnectionPool(
 
 app = FastAPI(title=APP_NAME)
 
+# All Google Sheets writes are serialised through this lock.
 _sheets_lock = threading.Lock()
-_last_sheet_sync = 0.0
+# Coalescing state for the post-ingest background sync (see _schedule_batch_syncs).
+_batch_sync_lock = threading.Lock()
+_batch_pending: set = set()
+_batch_active: set = set()
+# Internal key standing in for "rows with no batch_name".
+_UNGROUPED = "\x00__ungrouped__\x00"
+
+_gspread_client = None
+_TAB_BAD_CHARS = re.compile(r"[\[\]:\\/?*\x00-\x1f]")
 
 
 def now_ts() -> int:
@@ -90,7 +107,6 @@ def init_db() -> None:
             # Append-only: every ingested row is kept, even repeats of the same
             # domain / external_id (multiple contacts per company, re-runs of the
             # same Clay export, etc.). De-duplication is done downstream, not here.
-            # Plain (non-unique) index just to speed up later lookups by external_id.
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_external_id ON records(external_id)"
             )
@@ -99,6 +115,11 @@ def init_db() -> None:
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_created_at ON records(created_at DESC)"
+            )
+            # Group-by-batch lookups for the per-tab sheet sync.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_batch_name "
+                "ON records((payload->>'batch_name'))"
             )
         conn.commit()
 
@@ -126,12 +147,24 @@ def root() -> Dict[str, Any]:
         "docs": "/docs",
         "sheets_mirror": "configured" if sheets_configured() else "not_configured",
         "sync_on_ingest": SYNC_ON_INGEST,
+        "spreadsheet_id": SHEET_ID or None,
     }
 
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "healthy"}
+
+
+def effective_batch_name(row: IngestBody) -> Optional[str]:
+    """The batch_name a row will be grouped by: explicit field, else data.batch_name."""
+    if row.batch_name:
+        return row.batch_name
+    if isinstance(row.data, dict):
+        value = row.data.get("batch_name")
+        if value:
+            return str(value)
+    return None
 
 
 def insert_rows(rows: List[IngestBody]) -> Dict[str, int]:
@@ -175,6 +208,19 @@ def insert_rows(rows: List[IngestBody]) -> Dict[str, int]:
     return {"received": len(rows), "inserted": len(rows)}
 
 
+def _batch_keys_from_rows(rows: List[IngestBody]) -> List[str]:
+    keys = set()
+    for row in rows:
+        name = effective_batch_name(row)
+        keys.add(name if name else _UNGROUPED)
+    return list(keys)
+
+
+def _after_ingest(rows: List[IngestBody], background_tasks: BackgroundTasks) -> None:
+    if SYNC_ON_INGEST and sheets_configured():
+        background_tasks.add_task(_schedule_batch_syncs, _batch_keys_from_rows(rows))
+
+
 @app.post("/ingest")
 def ingest(
     body: IngestBody,
@@ -183,8 +229,7 @@ def ingest(
 ) -> Dict[str, Any]:
     require_api_key(x_api_key)
     result = insert_rows([body])
-    if SYNC_ON_INGEST:
-        background_tasks.add_task(maybe_sync_sheet)
+    _after_ingest([body], background_tasks)
     return {"success": True, **result}
 
 
@@ -196,8 +241,7 @@ def bulk_ingest(
 ) -> Dict[str, Any]:
     require_api_key(x_api_key)
     result = insert_rows(body.rows)
-    if SYNC_ON_INGEST:
-        background_tasks.add_task(maybe_sync_sheet)
+    _after_ingest(body.rows, background_tasks)
     return {"success": True, **result}
 
 
@@ -217,8 +261,7 @@ async def ingest_raw(
         data=payload.get("data", payload),
     )
     result = insert_rows([body])
-    if SYNC_ON_INGEST:
-        background_tasks.add_task(maybe_sync_sheet)
+    _after_ingest([body], background_tasks)
     return {"success": True, **result}
 
 
@@ -246,23 +289,36 @@ def list_records(
 
 
 def fetch_flattened(
-    limit: int,
+    limit: Optional[int] = None,
     status: Optional[str] = None,
+    batch_name: Optional[str] = None,
+    ungrouped: bool = False,
+    order: str = "desc",
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Pull records and flatten each JSONB payload up to the top level.
 
     Returns (fieldnames, rows) where fieldnames is the sorted union of every
     key seen, so a Clay column that only appears on some rows still gets a
-    column in the output.
+    column in the output. Optionally scoped to one batch_name (or the rows
+    with no batch_name when `ungrouped` is True).
     """
+    limit = limit or EXPORT_MAX_ROWS
+    where: List[str] = []
     params: List[Any] = []
-    sql = "SELECT id, external_id, payload, status, last_error, created_at, updated_at FROM records"
 
     if status:
-        sql += " WHERE status = %s"
+        where.append("status = %s")
         params.append(status)
+    if ungrouped:
+        where.append("(payload->>'batch_name') IS NULL")
+    elif batch_name is not None:
+        where.append("payload->>'batch_name' = %s")
+        params.append(batch_name)
 
-    sql += " ORDER BY id DESC LIMIT %s"
+    sql = "SELECT id, external_id, payload, status, last_error, created_at, updated_at FROM records"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY id {'ASC' if order == 'asc' else 'DESC'} LIMIT %s"
     params.append(limit)
 
     with pool.connection() as conn:
@@ -337,7 +393,7 @@ def export_csv(
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets mirror
+# Google Sheets mirror — one tab per Clay batch_name
 # ---------------------------------------------------------------------------
 
 def _cell(value: Any) -> Any:
@@ -350,59 +406,117 @@ def _cell(value: Any) -> Any:
     return value
 
 
-def _get_worksheet():
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    info = json.loads(GOOGLE_SA_JSON)
-    creds = Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
-    client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SHEET_ID)
-    try:
-        return spreadsheet.worksheet(SHEET_TAB)
-    except gspread.WorksheetNotFound:
-        return spreadsheet.add_worksheet(title=SHEET_TAB, rows=1000, cols=26)
+def tab_name_for(batch_name: Optional[str]) -> str:
+    """Sheet-tab-safe name for a batch. None -> the ungrouped tab."""
+    if batch_name is None:
+        return UNGROUPED_TAB
+    name = _TAB_BAD_CHARS.sub(" ", str(batch_name)).strip()
+    name = re.sub(r"\s+", " ", name)
+    return name[:90] or "export"
 
 
-def sync_sheet(limit: Optional[int] = None) -> Dict[str, Any]:
-    """Overwrite the target tab with the full dataset from Postgres (no de-dup)."""
-    if not sheets_configured():
-        return {"synced": False, "reason": "sheets_not_configured"}
+def _get_spreadsheet():
+    global _gspread_client
+    if _gspread_client is None:
+        info = json.loads(GOOGLE_SA_JSON)
+        creds = Credentials.from_service_account_info(info, scopes=SHEETS_SCOPES)
+        _gspread_client = gspread.authorize(creds)
+    return _gspread_client.open_by_key(SHEET_ID)
 
-    limit = limit or EXPORT_MAX_ROWS
-    fieldnames, rows = fetch_flattened(limit=limit)
-    values: List[List[Any]] = [fieldnames]
+
+def distinct_batches() -> List[Tuple[Optional[str], int]]:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload->>'batch_name' AS batch_name, count(*) AS n "
+                "FROM records GROUP BY 1 ORDER BY n DESC"
+            )
+            return [(r["batch_name"], r["n"]) for r in cur.fetchall()]
+
+
+def sync_one_tab(key: str) -> Dict[str, Any]:
+    """Rebuild a single tab from Postgres. `key` is a batch_name or _UNGROUPED."""
+    if key == _UNGROUPED:
+        title = UNGROUPED_TAB
+        fieldnames, rows = fetch_flattened(ungrouped=True, order="asc")
+    else:
+        title = tab_name_for(key)
+        fieldnames, rows = fetch_flattened(batch_name=key, order="asc")
+
+    values: List[List[Any]] = [fieldnames or ["message"]]
     for row in rows:
         values.append([_cell(row.get(name)) for name in fieldnames])
+    if not rows:
+        values.append(["no_data"])
+
+    n_rows = max(len(values), 1)
+    n_cols = max(len(fieldnames), 1)
 
     with _sheets_lock:
-        worksheet = _get_worksheet()
-        worksheet.resize(rows=max(len(values), 1), cols=max(len(fieldnames), 1))
-        worksheet.update(range_name="A1", values=values, value_input_option="RAW")
+        spreadsheet = _get_spreadsheet()
+        try:
+            worksheet = spreadsheet.worksheet(title)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=title, rows=n_rows, cols=n_cols)
+        worksheet.resize(rows=n_rows, cols=n_cols)
+        worksheet.update(values=values, range_name="A1", value_input_option="RAW")
 
-    logger.info("sheet sync ok: %d rows, %d columns", len(rows), len(fieldnames))
-    return {"synced": True, "rows": len(rows), "columns": len(fieldnames)}
+    logger.info("synced tab %r: %d rows x %d cols", title, len(rows), len(fieldnames))
+    return {"tab": title, "rows": len(rows), "columns": len(fieldnames)}
 
 
-def maybe_sync_sheet() -> Dict[str, Any]:
-    """Debounced sync used by the post-ingest background task."""
-    global _last_sheet_sync
+def _schedule_batch_syncs(keys: List[str]) -> None:
+    """Queue tab rebuilds, coalescing repeats for the same batch into one run."""
     if not sheets_configured():
-        return {"synced": False, "reason": "sheets_not_configured"}
-    now = time.time()
-    if now - _last_sheet_sync < SHEET_SYNC_MIN_INTERVAL:
-        return {"synced": False, "reason": "debounced"}
-    _last_sheet_sync = now
-    try:
-        return sync_sheet()
-    except Exception as exc:  # never let a Sheets hiccup break ingest
-        logger.exception("sheet sync failed")
-        return {"synced": False, "error": str(exc)[:500]}
+        return
+    to_start: List[str] = []
+    with _batch_sync_lock:
+        for key in keys:
+            _batch_pending.add(key)
+            if key not in _batch_active:
+                _batch_active.add(key)
+                to_start.append(key)
+    for key in to_start:
+        threading.Thread(target=_batch_sync_worker, args=(key,), daemon=True).start()
+
+
+def _batch_sync_worker(key: str) -> None:
+    while True:
+        if SHEET_SYNC_SETTLE_SECONDS > 0:
+            time.sleep(SHEET_SYNC_SETTLE_SECONDS)
+        with _batch_sync_lock:
+            if key not in _batch_pending:
+                _batch_active.discard(key)
+                return
+            _batch_pending.discard(key)
+        try:
+            sync_one_tab(key)
+        except Exception:
+            logger.exception("sheet sync failed for batch=%r", key)
+            time.sleep(3)  # brief backoff; a later ingest re-queues this batch
+
+
+@app.get("/batches")
+def batches() -> Dict[str, Any]:
+    return {
+        "batches": [
+            {
+                "batch_name": name,
+                "rows": count,
+                "tab": tab_name_for(name),
+            }
+            for name, count in distinct_batches()
+        ]
+    }
 
 
 @app.post("/sync-sheets")
 def sync_sheets_endpoint(
-    limit: int = Query(default=EXPORT_MAX_ROWS, ge=1, le=EXPORT_MAX_ROWS),
+    batch: Optional[str] = Query(
+        default=None,
+        description="Batch name to sync. Omit to (re)build every batch's tab. "
+        "Use an empty value or '__ungrouped__' for rows with no batch_name.",
+    ),
     x_api_key: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     require_api_key(x_api_key)
@@ -411,13 +525,20 @@ def sync_sheets_endpoint(
             status_code=400,
             detail="Google Sheets mirror is not configured (set GOOGLE_SA_JSON and SHEET_ID)",
         )
-    global _last_sheet_sync
+
     try:
-        result = sync_sheet(limit=limit)
+        if batch is not None:
+            key = _UNGROUPED if batch in ("", "__ungrouped__") else batch
+            return {"synced": [sync_one_tab(key)]}
+
+        results = []
+        for name, _count in distinct_batches():
+            results.append(sync_one_tab(_UNGROUPED if name is None else name))
+        return {"tabs": len(results), "synced": results}
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Sheet sync failed: {exc}")
-    _last_sheet_sync = time.time()
-    return result
 
 
 @app.post("/push")
